@@ -363,7 +363,7 @@ def init_db():
         """)
 
         # Usuário administrador padrão
-        senha_admin_hash = bcrypt.hashpw("admin123".encode(), bcrypt.gensalt()).decode()
+        senha_admin_hash = bcrypt.hashpw("Itapipoca2025#".encode(), bcrypt.gensalt()).decode()
         c.execute("""
             INSERT INTO usuarios (nome, primeiro_nome, matricula, senha_hash, prioridade, primeiro_login)
             VALUES (%s, %s, %s, %s, %s, %s)
@@ -1116,10 +1116,8 @@ def login_page():
     with col_info2:
         st.markdown("""
         <div class="success-card">
-            <h4>👮‍♀️ Para administradores:</h4>
+            <h4> Administradores:</h4>
             <ul>
-                <li><strong>Usuário:</strong> admin</li>
-                <li><strong>Senha:</strong> admin123</li>
                 <li>Gerencie turnos e usuários</li>
                 <li>Configure rodadas e limites</li>
                 <li>Acesse relatórios detalhados</li>
