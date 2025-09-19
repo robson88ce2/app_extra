@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.env
+.env.*
+
+# Excel ou dados sensíveis
+*.xlsx
+
+# Streamlit cache
+.streamlit/
+
+# Logs e temp
+*.log
