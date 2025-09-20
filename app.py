@@ -32,8 +32,13 @@ except Exception as e:
     st.error(f"Erro inesperado ao carregar configurações do banco de dados: {e}")
     st.stop()
 
-# Engine para uso com pandas e SQLAlchemy (usa seu próprio pool de conexões)
-db_engine = create_engine(DATABASE_URL)
+# Cache do engine SQLAlchemy para ser criado uma única vez por execução do app
+@st.cache_resource
+def get_db_engine():
+    """Retorna o engine SQLAlchemy, cacheado para ser criado uma única vez."""
+    return create_engine(DATABASE_URL)
+
+db_engine = get_db_engine()
 
 # Pool de conexões para psycopg2 (para operações que não usam pandas/SQLAlchemy)
 connection_pool = None
@@ -236,6 +241,10 @@ def show_metric_card(title, value, subtitle=""):
 @st.cache_data(ttl=60) # Cache para a sugestão de horas
 def calcular_sugestao_horas():
     """Calcula sugestão de divisão equilibrada de horas"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB para estas consultas:
+    # EXPLAIN ANALYZE SELECT SUM(horas) FROM turnos WHERE ativo=TRUE;
+    # EXPLAIN ANALYZE SELECT COUNT(*) FROM usuarios WHERE primeiro_nome != 'admin' AND ativo=TRUE;
+    # EXPLAIN ANALYZE SELECT SUM(horas) FROM turnos WHERE reservado_por IS NOT NULL AND ativo=TRUE;
     conn = None
     try:
         conn = get_connection()
@@ -369,7 +378,7 @@ def init_db():
                 limite_horas INTEGER,
                 ciclo_aberto BOOLEAN,
                 rodada INTEGER,
-                open_selection BOOLEAN DEFAULT FALSE -- NOVO CAMPO
+                open_selection BOOLEAN DEFAULT FALSE
             )''')
             # Controle de bloqueios (concorrência)
             c.execute('''CREATE TABLE IF NOT EXISTS locks (
@@ -430,14 +439,14 @@ def log_acao(usuario_id, acao, detalhes=""):
 @timed_cache(seconds=30)  # Cache de 30 segundos para configurações
 def get_config():
     """Retorna as configurações atuais do sistema com cache"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB:
+    # EXPLAIN ANALYZE SELECT limite_horas, ciclo_aberto, rodada, open_selection FROM config WHERE id=1;
     conn = None
     try:
         conn = get_connection()
         c = conn.cursor()
-        # Adiciona 'open_selection' na consulta
         c.execute("SELECT limite_horas, ciclo_aberto, rodada, open_selection FROM config WHERE id=1")
         r = c.fetchone()
-        # Retorna valor padrão para 'open_selection' se não encontrado
         return r if r else (48, True, 1, False) 
     except psycopg2.Error as e:
         st.error(f"Erro ao obter configurações: {e}")
@@ -446,7 +455,7 @@ def get_config():
         if conn:
             release_connection(conn)
 
-def update_config(limite=None, ciclo=None, rodada=None, open_selection=None): # Adiciona open_selection
+def update_config(limite=None, ciclo=None, rodada=None, open_selection=None):
     """Atualiza as configurações do sistema"""
     conn = None
     try:
@@ -459,7 +468,7 @@ def update_config(limite=None, ciclo=None, rodada=None, open_selection=None): # 
                 c.execute("UPDATE config SET ciclo_aberto=%s WHERE id=1", (bool(ciclo),)) # PostgreSQL usa TRUE/FALSE
             if rodada is not None:
                 c.execute("UPDATE config SET rodada=%s WHERE id=1", (int(rodada),))
-            if open_selection is not None: # NOVO: Atualiza open_selection
+            if open_selection is not None:
                 c.execute("UPDATE config SET open_selection=%s WHERE id=1", (bool(open_selection),))
         # Invalida o cache da configuração após a atualização
         get_config.clear_cache()
@@ -594,6 +603,8 @@ def alterar_senha_usuario(user_id, senha_atual, nova_senha):
 
 def get_user_by_login(login):
     """Busca usuário pelo login (primeiro nome)"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB:
+    # EXPLAIN ANALYZE SELECT id,nome,primeiro_nome,matricula,senha_hash,prioridade,horas_usadas,primeiro_login,ativo FROM usuarios WHERE primeiro_nome=%s AND ativo=TRUE;
     if not login:
         return None
     conn = None
@@ -610,9 +621,11 @@ def get_user_by_login(login):
         if conn:
             release_connection(conn)
 
-@st.cache_data(ttl=300) # Cache para listar usuários
+@st.cache_data(ttl=3600) # Cache para listar usuários (aumentado para 1 hora)
 def listar_usuarios(incluir_inativos=False):
     """Lista todos os usuários do sistema"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB:
+    # EXPLAIN ANALYZE SELECT id,nome,primeiro_nome,matricula,prioridade,horas_usadas,ativo,data_cadastro FROM usuarios ORDER BY nome;
     try:
         if incluir_inativos:
             df = pd.read_sql_query("SELECT id,nome,primeiro_nome,matricula,prioridade,horas_usadas,ativo,data_cadastro FROM usuarios ORDER BY nome", db_engine)
@@ -646,6 +659,9 @@ def add_turno(data_turno_obj, descricao, horas):
 @st.cache_data(ttl=60) # Cache para listar turnos
 def listar_turnos(disponiveis_only=False, incluir_inativos=False):
     """Lista os turnos do sistema com consulta otimizada"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB para estas consultas:
+    # EXPLAIN ANALYZE SELECT id, data_turno, descricao, horas FROM turnos WHERE reservado_por IS NULL AND ativo=TRUE ORDER BY data_turno;
+    # EXPLAIN ANALYZE SELECT t.id, t.data_turno, t.descricao, t.horas, u.nome as reservado_por, t.ativo FROM turnos t LEFT JOIN usuarios u ON t.reservado_por = u.id WHERE t.ativo=TRUE ORDER BY t.data_turno;
     try:
         query_parts = []
         if disponiveis_only:
@@ -676,15 +692,22 @@ def listar_turnos(disponiveis_only=False, incluir_inativos=False):
         st.error(f"Erro ao listar turnos: {e}")
         return pd.DataFrame()
 
-def user_chose_in_round(policial_id, rodada_num):
+def user_chose_in_round(policial_id, rodada_num, cursor=None): # Adiciona o parâmetro cursor
     """Verifica se o usuário *ainda possui* um turno reservado que foi originalmente escolhido em uma rodada específica."""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB:
+    # EXPLAIN ANALYZE SELECT COUNT(t.id) FROM turnos t JOIN escalas e ON t.id = e.turno_id WHERE t.reservado_por = %s AND t.ativo = TRUE AND e.policial_id = %s AND e.rodada = %s;
     conn = None
+    if cursor is None: # Só obtém uma nova conexão se nenhum cursor for fornecido
+        try:
+            conn = get_connection()
+            c = conn.cursor()
+        except psycopg2.Error as e:
+            st.error(f"Erro ao obter conexão para verificar escolha de rodada: {e}")
+            return False
+    else:
+        c = cursor # Usa o cursor fornecido
+
     try:
-        conn = get_connection()
-        c = conn.cursor()
-        # Verifica se o policial tem algum turno ATIVO reservado,
-        # e se esse turno foi registrado na tabela 'escalas' para a 'rodada_num' específica.
-        # Isso garante que apenas reservas *ativas* contem para a regra da rodada.
         c.execute("""
             SELECT COUNT(t.id)
             FROM turnos t
@@ -700,11 +723,15 @@ def user_chose_in_round(policial_id, rodada_num):
         st.error(f"Erro ao verificar escolha de rodada: {e}")
         return False
     finally:
-        if conn:
+        if conn: # Só libera a conexão se ela foi obtida nesta função
             release_connection(conn)
 
 def adquirir_bloqueio(turno_id, usuario_id, operacao):
     """Tenta adquirir um bloqueio para operação em um turno"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB para estas consultas:
+    # EXPLAIN ANALYZE DELETE FROM locks WHERE timestamp < NOW() - INTERVAL '30 seconds';
+    # EXPLAIN ANALYZE SELECT usuario_id FROM locks WHERE turno_id = %s;
+    # EXPLAIN ANALYZE INSERT INTO locks (turno_id, usuario_id, timestamp, operacao) VALUES (%s, %s, NOW(), %s) ON CONFLICT (turno_id) DO UPDATE SET usuario_id = EXCLUDED.usuario_id, timestamp = NOW(), operacao = EXCLUDED.operacao;
     conn = None
     try:
         conn = get_connection()
@@ -736,6 +763,8 @@ def adquirir_bloqueio(turno_id, usuario_id, operacao):
 
 def liberar_bloqueio(turno_id, usuario_id):
     """Libera um bloqueio adquirido"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB:
+    # EXPLAIN ANALYZE DELETE FROM locks WHERE turno_id = %s AND usuario_id = %s;
     conn = None
     try:
         conn = get_connection()
@@ -752,7 +781,7 @@ def liberar_bloqueio(turno_id, usuario_id):
 
 def reservar_turno(turno_id, policial_id):
     """Reserva um turno para um policial com controle de concorrência e otimização"""
-    # Adquirir bloqueio explícito primeiro
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB para as consultas internas.
     ok, msg = adquirir_bloqueio(turno_id, policial_id, "reserva")
     if not ok:
         return False, msg
@@ -765,7 +794,7 @@ def reservar_turno(turno_id, policial_id):
             c = conn.cursor()
             
             # 1. Bloqueio explícito no registro do turno e verificação de disponibilidade
-            # O SELECT FOR UPDATE garante que ninguém mais possa modificar este turno até o commit
+            # EXPLAIN ANALYZE SELECT reservado_por, horas, data_turno FROM turnos WHERE id=%s AND ativo=TRUE FOR UPDATE;
             c.execute("SELECT reservado_por, horas, data_turno FROM turnos WHERE id=%s AND ativo=TRUE FOR UPDATE", (turno_id,))
             r = c.fetchone()
             
@@ -777,7 +806,7 @@ def reservar_turno(turno_id, policial_id):
                 return False, "Turno já foi reservado por outro policial."
                 
             # 2. Obter dados do usuário e configurações em uma única consulta
-            # Adiciona open_selection na consulta
+            # EXPLAIN ANALYZE SELECT u.horas_usadas, c.limite_horas, c.rodada, c.open_selection FROM usuarios u, config c WHERE u.id=%s AND c.id=1;
             c.execute("""
                 SELECT u.horas_usadas, c.limite_horas, c.rodada, c.open_selection
                 FROM usuarios u, config c
@@ -795,13 +824,16 @@ def reservar_turno(turno_id, policial_id):
                 return False, f"Limite de {limite}h seria ultrapassado."
                 
             # 4. Verificar regra da rodada (se aplicável), mas somente se open_selection_mode NÃO estiver ativo
-            if not open_selection_mode: # NOVO: Condição para ignorar regras de rodada
+            if not open_selection_mode:
                 if rodada_atual == 1 and st.session_state['user']['prioridade'] == 0:
                     return False, "Apenas policiais prioritários podem escolher na Rodada 1."
-                elif rodada_atual == 2 and user_chose_in_round(policial_id, 1):
+                elif rodada_atual == 2 and user_chose_in_round(policial_id, 1, cursor=c): # Passa o cursor existente
                     return False, "Você já possui um turno reservado da rodada prioritária. Não pode escolher na rodada 2."
             
             # 5. Efetuar todas as atualizações
+            # EXPLAIN ANALYZE UPDATE turnos SET reservado_por=%s WHERE id=%s;
+            # EXPLAIN ANALYZE INSERT INTO escalas (turno_id, data_turno, policial_id, horas_turno, registrado_em, rodada) VALUES (%s,%s,%s,%s,NOW(),%s);
+            # EXPLAIN ANALYZE UPDATE usuarios SET horas_usadas = horas_usadas + %s WHERE id=%s;
             c.execute("UPDATE turnos SET reservado_por=%s WHERE id=%s", (policial_id, turno_id))
             c.execute("""
                 INSERT INTO escalas (turno_id, data_turno, policial_id, horas_turno, registrado_em, rodada) 
@@ -810,6 +842,7 @@ def reservar_turno(turno_id, policial_id):
             c.execute("UPDATE usuarios SET horas_usadas = horas_usadas + %s WHERE id=%s", (horas, policial_id))
             
             # 6. Log da ação
+            # EXPLAIN ANALYZE INSERT INTO logs_sistema (usuario_id, acao, detalhes, timestamp) VALUES (%s, %s, %s, NOW());
             c.execute("""
                 INSERT INTO logs_sistema (usuario_id, acao, detalhes, timestamp) 
                 VALUES (%s, %s, %s, NOW())
@@ -833,6 +866,7 @@ def reservar_turno(turno_id, policial_id):
 
 def cancelar_reserva(turno_id):
     """Cancela a reserva de um turno (função para admin)"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB para as consultas internas.
     admin_id_for_lock = st.session_state['user']['id'] if 'user' in st.session_state else -1
     ok, msg = adquirir_bloqueio(turno_id, admin_id_for_lock, "cancelamento_admin")
     if not ok:
@@ -842,6 +876,7 @@ def cancelar_reserva(turno_id):
         conn = get_connection()
         with conn: # Transação atômica
             c = conn.cursor()
+            # EXPLAIN ANALYZE SELECT reservado_por, horas FROM turnos WHERE id=%s FOR UPDATE;
             c.execute("SELECT reservado_por, horas FROM turnos WHERE id=%s FOR UPDATE", (turno_id,)) # Bloqueia a linha
             r = c.fetchone()
             if not r:
@@ -850,6 +885,8 @@ def cancelar_reserva(turno_id):
             if reservado_por is None:
                 return False, "Turno já está livre."
             # Remove a reserva
+            # EXPLAIN ANALYZE UPDATE usuarios SET horas_usadas = horas_usadas - %s WHERE id=%s;
+            # EXPLAIN ANALYZE UPDATE turnos SET reservado_por=NULL WHERE id=%s;
             c.execute("UPDATE usuarios SET horas_usadas = horas_usadas - %s WHERE id=%s", (horas, reservado_por))
             c.execute("UPDATE turnos SET reservado_por=NULL WHERE id=%s", (turno_id,))
             # Log da ação
@@ -870,6 +907,7 @@ def cancelar_reserva(turno_id):
 
 def cancelar_reserva_pelo_usuario(turno_id, usuario_id):
     """Permite que um usuário cancele sua própria reserva dentro do ciclo"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB para as consultas internas.
     ok, msg = adquirir_bloqueio(turno_id, usuario_id, "cancelamento_usuario")
     if not ok:
         return False, msg
@@ -883,11 +921,14 @@ def cancelar_reserva_pelo_usuario(turno_id, usuario_id):
             if not ciclo:
                 return False, "O ciclo está fechado. Não é possível cancelar reservas."
             # Verificar se o turno pertence ao usuário
+            # EXPLAIN ANALYZE SELECT reservado_por, horas FROM turnos WHERE id=%s FOR UPDATE;
             c.execute("SELECT reservado_por, horas FROM turnos WHERE id=%s FOR UPDATE", (turno_id,)) # Bloqueia a linha
             r = c.fetchone()
             if not r or r[0] != usuario_id:
                 return False, "Você não pode cancelar este turno, pois não é o proprietário ou o turno não existe."
             # Remove a reserva
+            # EXPLAIN ANALYZE UPDATE usuarios SET horas_usadas = horas_usadas - %s WHERE id=%s;
+            # EXPLAIN ANALYZE UPDATE turnos SET reservado_por=NULL WHERE id=%s;
             c.execute("UPDATE usuarios SET horas_usadas = horas_usadas - %s WHERE id=%s", (r[1], usuario_id))
             c.execute("UPDATE turnos SET reservado_por=NULL WHERE id=%s", (turno_id,))
             # Log da ação
@@ -908,6 +949,7 @@ def cancelar_reserva_pelo_usuario(turno_id, usuario_id):
 
 def excluir_turno(turno_id):
     """Exclui um turno permanentemente do sistema (apenas se não estiver reservado)"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB para as consultas internas.
     admin_id_for_lock = st.session_state['user']['id'] if 'user' in st.session_state else -1
     ok, msg = adquirir_bloqueio(turno_id, admin_id_for_lock, "exclusao_turno")
     if not ok:
@@ -918,6 +960,7 @@ def excluir_turno(turno_id):
         with conn: # Transação atômica
             c = conn.cursor()
             # Verificar se o turno está reservado
+            # EXPLAIN ANALYZE SELECT reservado_por FROM turnos WHERE id=%s FOR UPDATE;
             c.execute("SELECT reservado_por FROM turnos WHERE id=%s FOR UPDATE", (turno_id,)) # Bloqueia a linha
             result = c.fetchone()
             if not result:
@@ -925,6 +968,7 @@ def excluir_turno(turno_id):
             if result[0] is not None:
                 return False, "Não é possível excluir um turno reservado. Cancele a reserva primeiro."
             # Remover o turno
+            # EXPLAIN ANALYZE DELETE FROM turnos WHERE id=%s;
             c.execute("DELETE FROM turnos WHERE id=%s", (turno_id,))
             # Log da ação
             log_acao(admin_id_for_lock, "EXCLUSAO_TURNO_PERMANENTE", f"Turno ID: {turno_id}")
@@ -944,6 +988,8 @@ def excluir_turno(turno_id):
 @st.cache_data(ttl=60) # Cache para a escala final
 def listar_escala_final():
     """Lista a escala final com todos os turnos"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB:
+    # EXPLAIN ANALYZE SELECT t.data_turno, t.descricao, t.horas, u.nome as policial FROM turnos t LEFT JOIN usuarios u ON t.reservado_por = u.id WHERE t.ativo=TRUE ORDER BY t.data_turno;
     try:
         df = pd.read_sql_query("""SELECT t.data_turno, t.descricao, t.horas, u.nome as policial
                                    FROM turnos t LEFT JOIN usuarios u ON t.reservado_por = u.id
@@ -961,6 +1007,7 @@ def listar_escala_final():
 # =====================================================
 def gerar_pdf_bytes():
     """Gera PDF da escala completa com otimização de performance"""
+    # Para análise de performance, use EXPLAIN ANALYZE no seu DB para as consultas internas.
     try:
         # Garante que os dados estão atualizados
         listar_escala_final.clear() 
@@ -970,6 +1017,7 @@ def gerar_pdf_bytes():
         df = listar_escala_final() # Agora vai buscar dados frescos
         
         # Também carregar resumo em uma única consulta
+        # EXPLAIN ANALYZE SELECT nome, horas_usadas FROM usuarios WHERE horas_usadas > 0 AND ativo=TRUE ORDER BY nome;
         df_resumo = pd.read_sql_query("""
             SELECT 
                 nome, 
@@ -1028,7 +1076,7 @@ def gerar_pdf_bytes():
 def show_change_password_modal():
     """Mostra modal para alteração de senha no primeiro login"""
     with st.form("change_password_form"):
-        st.markdown("### 🔐 Primeira vez? Altere sua senha!")
+        st.markdown("<h3>🔐 Primeira vez? Altere sua senha!</h3>")
         st.info("Por segurança, recomendamos que você altere sua senha padrão.")
         senha_atual = st.text_input("🔑 Senha atual (sua matrícula)", type="password")
         nova_senha = st.text_input("🆕 Nova senha", type="password")
@@ -1199,6 +1247,7 @@ def admin_panel():
     try:
         conn = get_connection()
         c = conn.cursor()
+        # EXPLAIN ANALYZE SELECT SUM(horas) FROM turnos WHERE reservado_por IS NULL AND ativo=TRUE;
         c.execute("SELECT SUM(horas) FROM turnos WHERE reservado_por IS NULL AND ativo=TRUE")
         unreserved_row = c.fetchone()
         horas_unreserved = int(unreserved_row[0]) if unreserved_row and unreserved_row[0] is not None else 0
@@ -1224,7 +1273,7 @@ def admin_panel():
         with col2:
             st.markdown(f"""
             <div class="warning-card">
-                <h4>⏰ Turnos Não Alocados</h4>
+                <h4>⏰ Quantidade de Horas Nao Preechidas</h4>
                 <h2>{horas_unreserved}h</h2>
                 <p>Precisam ser preenchidos</p>
             </div>
@@ -1242,6 +1291,7 @@ def admin_panel():
             conn = get_connection()
             c = conn.cursor()
             # Consulta para verificar quais policiais têm turnos ativos reservados da rodada 1
+            # EXPLAIN ANALYZE SELECT t.reservado_por FROM turnos t JOIN escalas e ON t.id = e.turno_id WHERE t.reservado_por IS NOT NULL AND t.ativo = TRUE AND e.rodada = 1 GROUP BY t.reservado_por;
             c.execute("""
                 SELECT t.reservado_por
                 FROM turnos t
@@ -1427,7 +1477,7 @@ def admin_panel():
                 log_acao(st.session_state['user']['id'], "CONFIG_RODADA", "Rodada 1 iniciada")
                 st.success("✅ Rodada 1 ativada!")
                 st.rerun()
-            if st.button("2️⃣ Iniciar Rodada 2 (Não prioritários)", use_container_width=True):
+            if st.button("2️⃣ Iniciar Rodada 2 (Todos)", use_container_width=True):
                 update_config(rodada=2)
                 log_acao(st.session_state['user']['id'], "CONFIG_RODADA", "Rodada 2 iniciada")
                 st.success("✅ Rodada 2 ativada!")
@@ -1489,6 +1539,7 @@ def admin_panel():
     with tab5:
         st.markdown('<div class="section-header"><h4>📋 Logs do Sistema</h4></div>', unsafe_allow_html=True)
         try:
+            # EXPLAIN ANALYZE SELECT l.timestamp, u.nome as usuario, l.acao, l.detalhes FROM logs_sistema l LEFT JOIN usuarios u ON l.usuario_id = u.id ORDER BY l.timestamp DESC LIMIT 100;
             df_logs = pd.read_sql_query("""
                 SELECT l.timestamp, u.nome as usuario, l.acao, l.detalhes
                 FROM logs_sistema l
@@ -1504,6 +1555,7 @@ def admin_panel():
             st.info(f"ℹ️ Erro ao carregar logs: {e}")
         st.markdown('<div class="section-header"><h4>🔍 Monitoramento de Conflitos (Bloqueios Ativos)</h4></div>', unsafe_allow_html=True)
         try:
+            # EXPLAIN ANALYZE SELECT l.turno_id, t.descricao, u.nome as usuario, l.timestamp, l.operacao FROM locks l JOIN turnos t ON l.turno_id = t.id JOIN usuarios u ON l.usuario_id = u.id ORDER BY l.timestamp DESC;
             df_locks = pd.read_sql_query("""
                 SELECT l.turno_id, t.descricao, u.nome as usuario, l.timestamp, l.operacao
                 FROM locks l
@@ -1559,6 +1611,7 @@ def policial_panel():
         c = conn.cursor()
         
         # 1. Obter horas do usuário (atualizadas)
+        # EXPLAIN ANALYZE SELECT horas_usadas FROM usuarios WHERE id=%s;
         c.execute("SELECT horas_usadas FROM usuarios WHERE id=%s", (user_id,))
         user_horas_row = c.fetchone()
         user_horas = user_horas_row[0] if user_horas_row else 0
@@ -1568,7 +1621,7 @@ def policial_panel():
         escolheu_r1 = False
         if rodada == 2:
             # user_chose_in_round agora verifica reservas ATIVAS
-            escolheu_r1 = user_chose_in_round(user['id'], 1) 
+            escolheu_r1 = user_chose_in_round(user['id'], 1, cursor=c) # Passa o cursor
             
     except psycopg2.Error as e:
         st.error(f"Erro ao carregar dados do usuário: {e}")
@@ -1664,6 +1717,7 @@ def policial_panel():
                                 try:
                                     conn_check = get_connection()
                                     c_check = conn_check.cursor()
+                                    # EXPLAIN ANALYZE SELECT reservado_por FROM turnos WHERE id=%s AND ativo=TRUE;
                                     c_check.execute("SELECT reservado_por FROM turnos WHERE id=%s AND ativo=TRUE", (int(row['id']),))
                                     check_result = c_check.fetchone()
                                     if check_result and check_result[0] is not None:
@@ -1688,6 +1742,7 @@ def policial_panel():
         st.markdown('<div class="section-header"><h4>📋 Meu Histórico de Turnos</h4></div>', unsafe_allow_html=True)
         try:
             # Consulta para o histórico completo, incluindo o status atual do turno
+            # EXPLAIN ANALYZE SELECT e.turno_id, e.data_turno, t.descricao, e.horas_turno, e.registrado_em, e.rodada, CASE WHEN t.reservado_por = e.policial_id AND t.ativo = TRUE THEN 'Reservado Ativo' WHEN t.reservado_por IS NULL THEN 'Cancelado' ELSE 'Reservado por Outro' END as status_atual_turno FROM escalas e LEFT JOIN turnos t ON e.turno_id = t.id WHERE e.policial_id={user['id']} ORDER BY e.registrado_em DESC;
             df_my = pd.read_sql_query(f"""
                 SELECT 
                     e.turno_id, 
@@ -1717,6 +1772,7 @@ def policial_panel():
             _, ciclo_aberto, _, _ = get_config() # NOVO: Desempacota open_selection_mode
             # Filtrar turnos que ainda estão ativos e reservados por este usuário
             try:
+                # EXPLAIN ANALYZE SELECT t.id, t.data_turno, t.descricao, t.horas FROM turnos t WHERE t.reservado_por = {user['id']} AND t.ativo = TRUE ORDER BY t.data_turno;
                 df_my_active_turnos = pd.read_sql_query(f"""
                     SELECT t.id, t.data_turno, t.descricao, t.horas
                     FROM turnos t
@@ -1798,7 +1854,8 @@ def policial_panel():
         st.markdown('<div class="section-header"><h4>📊 Meus Relatórios</h4></div>', unsafe_allow_html=True)
         if st.button("📄 Gerar PDF dos Meus Turnos Ativos", use_container_width=True):
             try:
-                # --- ALTERAÇÃO AQUI: Consulta apenas turnos ATIVOS e reservados pelo usuário ---
+                # Consulta apenas turnos ATIVOS e reservados pelo usuário
+                # EXPLAIN ANALYZE SELECT t.data_turno, t.descricao, t.horas FROM turnos t WHERE t.reservado_por = {user['id']} AND t.ativo = TRUE ORDER BY t.data_turno;
                 df_personal = pd.read_sql_query(f"""
                     SELECT t.data_turno, t.descricao, t.horas
                     FROM turnos t
@@ -1808,6 +1865,12 @@ def policial_panel():
             except Exception as e:
                 st.error(f"Erro ao carregar dados para relatório pessoal: {e}")
                 df_personal = pd.DataFrame()
+            
+            # --- CORREÇÃO APLICADA AQUI ---
+            # Recalcula o total de horas ativas diretamente do DataFrame de turnos ativos
+            total_horas_ativas_para_pdf = df_personal['horas'].sum() if not df_personal.empty else 0
+            # --- FIM DA CORREÇÃO ---
+
             # Gerar PDF personalizado
             pdf = FPDF()
             pdf.add_page()
@@ -1816,7 +1879,8 @@ def policial_panel():
             pdf.ln(5)
             pdf.set_font("Arial", "", 11)
             pdf.cell(0, 8, f"Matrícula: {user['matricula']}", 0, 1)
-            pdf.cell(0, 8, f"Total de horas ativas: {user_horas}h", 0, 1) # Reflete horas_usadas
+            # Usa o valor recalculado para o PDF
+            pdf.cell(0, 8, f"Total de horas ativas: {total_horas_ativas_para_pdf}h", 0, 1) 
             pdf.cell(0, 8, f"Gerado em: {datetime.now().strftime('%d/%m/%Y às %H:%M')}", 0, 1)
             pdf.ln(5)
             if df_personal.empty:
@@ -1857,12 +1921,18 @@ def policial_panel():
 # =====================================================
 def main():
     """Função principal da aplicação"""
-    # Inicializar o pool de conexões e o banco de dados
-    if initialize_connection_pool():
+    # Inicializar o pool de conexões uma única vez por sessão/deploy
+    if 'db_pool_initialized' not in st.session_state:
+        if initialize_connection_pool():
+            st.session_state['db_pool_initialized'] = True
+        else:
+            st.error("Falha ao inicializar o pool de conexões. Verifique as configurações do banco de dados.")
+            st.stop() # Interrompe a execução se o pool falhar
+
+    # Rodar init_db() apenas uma vez por sessão/deploy
+    if 'db_initialized' not in st.session_state:
         init_db()
-    else:
-        st.error("Falha ao inicializar o sistema. Verifique as configurações do banco de dados.")
-        st.stop() # Interrompe a execução se o pool falhar
+        st.session_state['db_initialized'] = True
 
     # Sidebar
     st.sidebar.markdown("""
@@ -1880,7 +1950,7 @@ def main():
         st.sidebar.markdown(f"""
         <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
                                  color: white; padding: 1rem; border-radius: 10px; margin-bottom: 1rem;">
-            <h4 style="margin: 0;">👤 {user['nome']}</h4>
+            <h4 style="margin: 0;'>👤 {user['nome']}</h4>
             <p style="margin: 0; font-size: 0.8rem;">Matrícula: {user['matricula']}</p>
             <p style="margin: 0; font-size: 0.8rem;">
                 {'⭐ Prioritário' if user['prioridade'] == 1 else '👤 Regular'}
@@ -1890,9 +1960,9 @@ def main():
         """, unsafe_allow_html=True)
         # Menu de navegação
         if user['primeiro'] == 'admin':
-            opcoes = ["🔧 Painel Admin", " Visualizar Escala"]
+            opcoes = ["🔧 Painel Admin", "  Visualizar Escala"]
         else:
-            opcoes = ["🏠 Meu Painel", " Visualizar Escala"]
+            opcoes = ["🏠 Meu Painel", "  Visualizar Escala"]
         page = st.sidebar.selectbox("📋 Navegação", opcoes)
         # Renderização das páginas
         if page == "🔧 Painel Admin":
@@ -1902,7 +1972,7 @@ def main():
         else: # Visualizar Escala
             st.markdown("""
             <div class="main-header">
-                <h1> Escala Atual</h1>
+                <h1>  Escala Atual</h1>
                 <p>Visualização completa dos turnos e alocações</p>
             </div>
             """, unsafe_allow_html=True)
@@ -1931,7 +2001,7 @@ def main():
                     'policial': 'Policial Alocado'
                 })
                 # Preencher valores nulos
-                df_display['Policial Alocado'] = df_display['Policial Alocado'].fillna('🔴 NÃO ALOCADO')
+                df_display['Policial Alocado'] = df_display['Policial Alocado'].fillna('🔴 NÃO PREENCHIDO')
                 st.dataframe(df_display, use_container_width=True)
                 # Botão para download
                 if st.button("📄 Baixar PDF da Escala", use_container_width=True):
