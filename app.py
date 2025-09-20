@@ -368,7 +368,8 @@ def init_db():
                 id INTEGER PRIMARY KEY,
                 limite_horas INTEGER,
                 ciclo_aberto BOOLEAN,
-                rodada INTEGER
+                rodada INTEGER,
+                open_selection BOOLEAN DEFAULT FALSE -- NOVO CAMPO
             )''')
             # Controle de bloqueios (concorrência)
             c.execute('''CREATE TABLE IF NOT EXISTS locks (
@@ -394,8 +395,8 @@ def init_db():
 
             # Configuração inicial
             c.execute("""
-                INSERT INTO config (id, limite_horas, ciclo_aberto, rodada)
-                VALUES (1, 48, TRUE, 1)
+                INSERT INTO config (id, limite_horas, ciclo_aberto, rodada, open_selection)
+                VALUES (1, 48, TRUE, 1, FALSE)
                 ON CONFLICT (id) DO NOTHING
             """)
             # Usuário administrador padrão
@@ -433,17 +434,19 @@ def get_config():
     try:
         conn = get_connection()
         c = conn.cursor()
-        c.execute("SELECT limite_horas, ciclo_aberto, rodada FROM config WHERE id=1")
+        # Adiciona 'open_selection' na consulta
+        c.execute("SELECT limite_horas, ciclo_aberto, rodada, open_selection FROM config WHERE id=1")
         r = c.fetchone()
-        return r if r else (48, True, 1) # Retorna True para ciclo_aberto
+        # Retorna valor padrão para 'open_selection' se não encontrado
+        return r if r else (48, True, 1, False) 
     except psycopg2.Error as e:
         st.error(f"Erro ao obter configurações: {e}")
-        return (48, True, 1) # Valores padrão em caso de erro
+        return (48, True, 1, False) # Valores padrão em caso de erro
     finally:
         if conn:
             release_connection(conn)
 
-def update_config(limite=None, ciclo=None, rodada=None):
+def update_config(limite=None, ciclo=None, rodada=None, open_selection=None): # Adiciona open_selection
     """Atualiza as configurações do sistema"""
     conn = None
     try:
@@ -456,6 +459,8 @@ def update_config(limite=None, ciclo=None, rodada=None):
                 c.execute("UPDATE config SET ciclo_aberto=%s WHERE id=1", (bool(ciclo),)) # PostgreSQL usa TRUE/FALSE
             if rodada is not None:
                 c.execute("UPDATE config SET rodada=%s WHERE id=1", (int(rodada),))
+            if open_selection is not None: # NOVO: Atualiza open_selection
+                c.execute("UPDATE config SET open_selection=%s WHERE id=1", (bool(open_selection),))
         # Invalida o cache da configuração após a atualização
         get_config.clear_cache()
         # Invalida cache de sugestão de horas, pois pode depender do limite
@@ -772,8 +777,9 @@ def reservar_turno(turno_id, policial_id):
                 return False, "Turno já foi reservado por outro policial."
                 
             # 2. Obter dados do usuário e configurações em uma única consulta
+            # Adiciona open_selection na consulta
             c.execute("""
-                SELECT u.horas_usadas, c.limite_horas, c.rodada
+                SELECT u.horas_usadas, c.limite_horas, c.rodada, c.open_selection
                 FROM usuarios u, config c
                 WHERE u.id=%s AND c.id=1
             """, (policial_id,))
@@ -782,15 +788,18 @@ def reservar_turno(turno_id, policial_id):
             if not user_data:
                 return False, "Usuário não encontrado."
                 
-            horas_usadas, limite, rodada_atual = user_data
+            horas_usadas, limite, rodada_atual, open_selection_mode = user_data # Desempacota open_selection
             
             # 3. Verificar limite de horas
             if horas_usadas + horas > limite:
                 return False, f"Limite de {limite}h seria ultrapassado."
                 
-            # 4. Verificar regra da rodada (se aplicável)
-            if rodada_atual == 2 and user_chose_in_round(policial_id, 1): # user_chose_in_round agora verifica reservas ATIVAS
-                return False, "Você já possui um turno reservado da rodada prioritária. Não pode escolher na rodada 2."
+            # 4. Verificar regra da rodada (se aplicável), mas somente se open_selection_mode NÃO estiver ativo
+            if not open_selection_mode: # NOVO: Condição para ignorar regras de rodada
+                if rodada_atual == 1 and st.session_state['user']['prioridade'] == 0:
+                    return False, "Apenas policiais prioritários podem escolher na Rodada 1."
+                elif rodada_atual == 2 and user_chose_in_round(policial_id, 1):
+                    return False, "Você já possui um turno reservado da rodada prioritária. Não pode escolher na rodada 2."
             
             # 5. Efetuar todas as atualizações
             c.execute("UPDATE turnos SET reservado_por=%s WHERE id=%s", (policial_id, turno_id))
@@ -870,7 +879,7 @@ def cancelar_reserva_pelo_usuario(turno_id, usuario_id):
         with conn: # Transação atômica
             c = conn.cursor()
             # Verificar se o ciclo está aberto
-            _, ciclo, _ = get_config() # get_config usa cache, não abre nova conexão
+            _, ciclo, _, _ = get_config() # get_config usa cache, não abre nova conexão, agora retorna 4 valores
             if not ciclo:
                 return False, "O ciclo está fechado. Não é possível cancelar reservas."
             # Verificar se o turno pertence ao usuário
@@ -1108,12 +1117,11 @@ def login_page():
         <div class="info-card">
             <h4>📋 Como usar o sistema:</h4>
             <ul>
-                <li>Faça login com seu primeiro nome(minúsculo) e senha(Sua matrícula)</li>
-                <li>No primeiro acesso, poderá  alterar sua senha ou altera na área do usuário</li>
-                <li>Os turnos somentes serão visíveis quando o administrador autorizar</li>
-                <li>Escolha turnos disponíveis, qunado atingir o limite, não poderá mais escolher</li>
+                <li>Faça login com seu primeiro nome e senha</li>
+                <li>No primeiro acesso, pode alterar sua senha</li>
+                <li>Escolha turnos disponíveis</li>
                 <li>Acompanhe suas horas trabalhadas</li>
-                <li>Gere relatórios em PDF na Aréa do usuário</li>
+                <li>Gere relatórios em PDF</li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -1163,7 +1171,7 @@ def admin_panel():
         <h1>🔧 Painel do Administrador</h1>
     </div>
     """, unsafe_allow_html=True)
-    limite, ciclo, rodada = get_config()
+    limite, ciclo, rodada, open_selection_mode = get_config() # Desempacota open_selection_mode
     # Status do sistema
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -1175,8 +1183,8 @@ def admin_panel():
         rodada_text = "1️⃣ PRIORITÁRIOS" if rodada == 1 else "2️⃣ TODOS"
         show_metric_card("Rodada Atual", rodada_text, "Quem pode escolher")
     with col4:
-        total_usuarios = len(listar_usuarios())
-        show_metric_card("Total de Usuários", f"{total_usuarios}", "Ativos")
+        status_open_selection = "✅ LIGADO" if open_selection_mode else "❌ DESLIGADO" # NOVO: Exibe status
+        show_metric_card("Seleção Livre", status_open_selection, "Ignora prioridade/rodada") # NOVO: Métrica de seleção livre
     st.markdown("---")
     # Sugestão de divisão equilibrada
     show_sugestao_divisao()
@@ -1419,7 +1427,7 @@ def admin_panel():
                 log_acao(st.session_state['user']['id'], "CONFIG_RODADA", "Rodada 1 iniciada")
                 st.success("✅ Rodada 1 ativada!")
                 st.rerun()
-            if st.button("2️⃣ Iniciar Rodada 2 (Todos)", use_container_width=True):
+            if st.button("2️⃣ Iniciar Rodada 2 (Não prioritários)", use_container_width=True):
                 update_config(rodada=2)
                 log_acao(st.session_state['user']['id'], "CONFIG_RODADA", "Rodada 2 iniciada")
                 st.success("✅ Rodada 2 ativada!")
@@ -1441,6 +1449,22 @@ def admin_panel():
                 log_acao(st.session_state['user']['id'], "CONFIG_CICLO", "Ciclo encerrado")
                 st.warning("⚠️ Ciclo encerrado!")
                 st.rerun()
+        st.markdown("---")
+        # NOVO: Controle de Seleção Livre
+        st.markdown('<div class="section-header"><h4>🔓 Modo de Seleção Livre</h4></div>', unsafe_allow_html=True)
+        if open_selection_mode:
+            st.success("✅ O modo de seleção livre está ATIVO. As regras de rodada e prioridade estão desativadas.")
+            if st.button("❌ Desativar Seleção Livre", use_container_width=True):
+                update_config(open_selection=False)
+                log_acao(st.session_state['user']['id'], "CONFIG_OPEN_SELECTION", "Seleção livre desativada")
+                st.rerun()
+        else:
+            st.info("ℹ️ O modo de seleção livre está INATIVO. As regras de rodada e prioridade estão ativas.")
+            if st.button("✅ Ativar Seleção Livre", use_container_width=True):
+                update_config(open_selection=True)
+                log_acao(st.session_state['user']['id'], "CONFIG_OPEN_SELECTION", "Seleção livre ativada")
+                st.rerun()
+
     with tab4:
         st.markdown('<div class="section-header"><h4>📊 Relatórios e Exportação</h4></div>', unsafe_allow_html=True)
         if st.button("📄 Gerar PDF da Escala Completa", use_container_width=True):
@@ -1528,7 +1552,7 @@ def policial_panel():
     # Obter todos os dados necessários em uma única conexão (ou poucas)
     conn = None
     user_horas = user.get('horas_usadas', 0) # Valor padrão da sessão
-    limite, ciclo, rodada = get_config() # get_config é cacheado
+    limite, ciclo, rodada, open_selection_mode = get_config() # NOVO: Desempacota open_selection_mode
     
     try:
         conn = get_connection()
@@ -1572,8 +1596,11 @@ def policial_panel():
         status_ciclo = "🟢 ABERTO" if ciclo else "🔴 FECHADO"
         show_metric_card("Status", status_ciclo, "para escolhas")
     with col4:
-        rodada_text = "1️⃣ PRIORITÁRIOS" if rodada == 1 else "2️⃣ TODOS"
-        show_metric_card("Rodada", rodada_text, "atual do sistema")
+        if open_selection_mode: # NOVO: Mostra status de seleção livre
+            show_metric_card("Seleção", "🔓 LIVRE", "Sem restrições de rodada")
+        else:
+            rodada_text = "1️⃣ PRIORITÁRIOS" if rodada == 1 else "2️⃣ TODOS"
+            show_metric_card("Rodada", rodada_text, "atual do sistema")
     # Mostrar sugestão de horas
     sugestao = calcular_sugestao_horas()
     if sugestao['sugestao_equilibrada'] > 0:
@@ -1583,15 +1610,23 @@ def policial_panel():
     # Verificações de permissão
     pode_escolher = True
     motivo_bloqueio = ""
-    if not ciclo:
-        pode_escolher = False
-        motivo_bloqueio = "🔴 O ciclo de escolhas está encerrado."
-    elif rodada == 1 and user['prioridade'] == 0:
-        pode_escolher = False
-        motivo_bloqueio = "🟡 Apenas policiais prioritários podem escolher na Rodada 1."
-    elif rodada == 2 and escolheu_r1: # Usar a variável pré-carregada
-        pode_escolher = False
-        motivo_bloqueio = "🟡 Você já possui um turno reservado da Rodada 1. Não pode escolher na rodada 2."
+
+    if open_selection_mode: # NOVO: Se seleção livre, pode escolher (respeitando limite de horas)
+        motivo_bloqueio = "🔓 O modo de seleção livre está ATIVO. Todas as restrições de rodada e prioridade estão desativadas."
+        if not ciclo: # Mas o ciclo ainda precisa estar aberto
+             pode_escolher = False
+             motivo_bloqueio = "🔴 O ciclo de escolhas está encerrado, mesmo no modo de seleção livre."
+    else: # Lógica normal de rodadas e prioridade
+        if not ciclo:
+            pode_escolher = False
+            motivo_bloqueio = "🔴 O ciclo de escolhas está encerrado."
+        elif rodada == 1 and user['prioridade'] == 0:
+            pode_escolher = False
+            motivo_bloqueio = "🟡 Apenas policiais prioritários podem escolher na Rodada 1."
+        elif rodada == 2 and escolheu_r1: # Usar a variável pré-carregada
+            pode_escolher = False
+            motivo_bloqueio = "🟡 Você já possui um turno reservado da Rodada 1. Não pode escolher na rodada 2."
+    
     # Abas do painel
     tab1, tab2, tab3, tab4 = st.tabs(["🎯 Escolher Turnos", "📋 Minha Escala", "👤 Perfil", "📊 Relatórios"])
     with tab1:
@@ -1679,7 +1714,7 @@ def policial_panel():
         else:
             st.markdown('#### 🔄 Meus Turnos Atuais')
             # Verificar se o ciclo está aberto
-            _, ciclo_aberto, _ = get_config()
+            _, ciclo_aberto, _, _ = get_config() # NOVO: Desempacota open_selection_mode
             # Filtrar turnos que ainda estão ativos e reservados por este usuário
             try:
                 df_my_active_turnos = pd.read_sql_query(f"""
