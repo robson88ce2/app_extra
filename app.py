@@ -1108,11 +1108,12 @@ def login_page():
         <div class="info-card">
             <h4>📋 Como usar o sistema:</h4>
             <ul>
-                <li>Faça login com seu primeiro nome e senha</li>
-                <li>No primeiro acesso, pode alterar sua senha</li>
-                <li>Escolha turnos disponíveis</li>
+                <li>Faça login com seu primeiro nome(minúsculo) e senha(Sua matrícula)</li>
+                <li>No primeiro acesso, poderá  alterar sua senha ou altera na área do usuário</li>
+                <li>Os turnos somentes serão visíveis quando o administrador autorizar</li>
+                <li>Escolha turnos disponíveis, qunado atingir o limite, não poderá mais escolher</li>
                 <li>Acompanhe suas horas trabalhadas</li>
-                <li>Gere relatórios em PDF</li>
+                <li>Gere relatórios em PDF na Aréa do usuário</li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
