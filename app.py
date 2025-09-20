@@ -1480,7 +1480,7 @@ def admin_panel():
             else:
                 st.error("Erro ao gerar PDF.")
         # Visualização da escala atual
-        st.markdown("**👀 Prévia da Escala Atual:**")
+        st.markdown("** Prévia da Escala Atual:**")
         df_escala = listar_escala_final()
         if not df_escala.empty:
             st.dataframe(df_escala, use_container_width=True)
@@ -1890,9 +1890,9 @@ def main():
         """, unsafe_allow_html=True)
         # Menu de navegação
         if user['primeiro'] == 'admin':
-            opcoes = ["🔧 Painel Admin", "👁️ Visualizar Escala"]
+            opcoes = ["🔧 Painel Admin", " Visualizar Escala"]
         else:
-            opcoes = ["🏠 Meu Painel", "👁️ Visualizar Escala"]
+            opcoes = ["🏠 Meu Painel", " Visualizar Escala"]
         page = st.sidebar.selectbox("📋 Navegação", opcoes)
         # Renderização das páginas
         if page == "🔧 Painel Admin":
@@ -1902,7 +1902,7 @@ def main():
         else: # Visualizar Escala
             st.markdown("""
             <div class="main-header">
-                <h1>👁️ Escala Atual</h1>
+                <h1> Escala Atual</h1>
                 <p>Visualização completa dos turnos e alocações</p>
             </div>
             """, unsafe_allow_html=True)
