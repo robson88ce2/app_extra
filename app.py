@@ -949,7 +949,6 @@ def cancelar_reserva_pelo_usuario(turno_id, usuario_id):
 
 def excluir_turno(turno_id):
     """Exclui um turno permanentemente do sistema (apenas se não estiver reservado)"""
-    # Para análise de performance, use EXPLAIN ANALYZE no seu DB para as consultas internas.
     admin_id_for_lock = st.session_state['user']['id'] if 'user' in st.session_state else -1
     ok, msg = adquirir_bloqueio(turno_id, admin_id_for_lock, "exclusao_turno")
     if not ok:
@@ -960,18 +959,24 @@ def excluir_turno(turno_id):
         with conn: # Transação atômica
             c = conn.cursor()
             # Verificar se o turno está reservado
-            # EXPLAIN ANALYZE SELECT reservado_por FROM turnos WHERE id=%s FOR UPDATE;
             c.execute("SELECT reservado_por FROM turnos WHERE id=%s FOR UPDATE", (turno_id,)) # Bloqueia a linha
             result = c.fetchone()
             if not result:
+                liberar_bloqueio(turno_id, admin_id_for_lock) # Libera o bloqueio
                 return False, "Turno não encontrado."
             if result[0] is not None:
+                liberar_bloqueio(turno_id, admin_id_for_lock) # Libera o bloqueio
                 return False, "Não é possível excluir um turno reservado. Cancele a reserva primeiro."
-            # Remover o turno
-            # EXPLAIN ANALYZE DELETE FROM turnos WHERE id=%s;
+            
+            # Remover o bloqueio PRIMEIRO
+            c.execute("DELETE FROM locks WHERE turno_id = %s", (turno_id,))
+            
+            # DEPOIS remover o turno
             c.execute("DELETE FROM turnos WHERE id=%s", (turno_id,))
+            
             # Log da ação
             log_acao(admin_id_for_lock, "EXCLUSAO_TURNO_PERMANENTE", f"Turno ID: {turno_id}")
+        
         # Invalida os caches relevantes
         listar_turnos.clear()
         listar_escala_final.clear()
@@ -979,11 +984,19 @@ def excluir_turno(turno_id):
         return True, "Turno excluído com sucesso."
     except psycopg2.Error as e:
         st.error(f"Erro ao excluir turno: {e}")
+        if conn:
+            try:
+                # Em caso de erro, garantir que o bloqueio seja liberado
+                with conn:
+                    c = conn.cursor() 
+                    c.execute("DELETE FROM locks WHERE turno_id = %s", (turno_id,))
+            except:
+                pass # Ignoramos erros aqui pois é apenas uma tentativa de limpeza
         return False, f"Erro ao excluir turno: {str(e)}"
     finally:
         if conn:
             release_connection(conn)
-        liberar_bloqueio(turno_id, admin_id_for_lock)
+
 
 @st.cache_data(ttl=60) # Cache para a escala final
 def listar_escala_final():
